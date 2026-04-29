@@ -1,0 +1,284 @@
+---
+- name: Deploy FastAPI + NeMo Microservices on Ubuntu EC2
+  hosts: all
+  become: true
+
+  vars:
+    app_root: /home/ubuntu/synth-data-gen
+    code_root: "{{ app_root }}/src"
+    repo_url: https://{{ github_token }}@github.com/rikton9/synth-data-gen.git
+    tmp_dir: /home/ubuntu/tmp
+    nemo_dir: "{{ code_root }}/NemoDataDesignerAPI"
+    venv_dir: "{{ code_root }}/venv"
+    pip_cache_dir: /home/ubuntu/.cache/pip
+    nginx_conf_path: /etc/nginx/sites-available/nemo_proxy
+    nginx_link_path: /etc/nginx/sites-enabled/nemo_proxy
+    proxy_secret_key: "gXlZNSuol-ZA_CpF_PhpNLFLpzBgTuvDNjPaTnCbk0c="
+    pg_user: "synthuser"
+    pg_db: "synthdb"
+    pg_port: "5432"
+
+  tasks:
+
+  - name: Create 8GB swap file (Prevents NeMo OOM crashes)
+    shell: |
+      if [ ! -f /swapfile ] ||[ $(stat -c %s /swapfile) -lt 8000000000 ]; then
+        swapoff /swapfile || true
+        rm -f /swapfile
+        fallocate -l 8G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=8192
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+      fi
+
+  - name: Add deadsnakes PPA
+    apt_repository:
+      repo: ppa:deadsnakes/ppa
+      state: present
+      update_cache: yes
+
+  - name: Install required packages
+    apt:
+      name:
+        - python3.11
+        - python3.11-venv
+        - python3.11-dev
+        - build-essential
+        - nginx
+        - git
+        - docker.io
+      state: present
+      update_cache: yes
+
+  - name: Enable and start Docker
+    systemd:
+      name: docker
+      enabled: yes
+      state: started
+
+  - name: Enable and start NGINX
+    systemd:
+      name: nginx
+      enabled: yes
+      state: started
+
+  - name: Remove previous repo if exists
+    file:
+      path: "{{ app_root }}"
+      state: absent
+
+  - name: Clone repository
+    git:
+      repo: "{{ repo_url }}"
+      dest: "{{ app_root }}"
+      version: main
+      force: yes
+    become_user: ubuntu
+
+  - name: Create virtual environment
+    command: python3.11 -m venv {{ venv_dir }}
+    args:
+      creates: "{{ venv_dir }}"
+    become_user: ubuntu
+
+  - name: Upgrade pip
+    command: "{{ venv_dir }}/bin/pip install --upgrade pip"
+    become_user: ubuntu
+
+  - name: Install all Python requirements
+    shell: |
+      find "{{ app_root }}" -type f -name "requirements.txt" -print0 \
+      | xargs -0 cat \
+      | sort | uniq \
+      | "{{ venv_dir }}/bin/pip" install --prefer-binary --timeout 1200 -r /dev/stdin
+    become_user: ubuntu
+    retries: 3
+    delay: 30
+
+  - name: Make nemo_setup.sh executable
+    file:
+      path: "{{ code_root }}/nemo_setup.sh"
+      mode: '0755'
+      owner: ubuntu
+      group: ubuntu
+    become_user: ubuntu
+
+  - name: Execute nemo setup script
+    command: ./nemo_setup.sh
+    args:
+      chdir: "{{ code_root }}"
+    become_user: ubuntu
+    async: 3600
+    poll: 15
+
+  - name: Wait for NeMo API to be ready
+    uri:
+      url: http://127.0.0.1:8080/v1/data-designer/jobs
+      method: GET
+      status_code: 200
+    register: nemo_health
+    retries: 120
+    delay: 10
+    until: nemo_health.status == 200
+
+  # ── PostgreSQL (Docker, own systemd unit) ─────────────────────────────────
+  - name: Create PostgreSQL data directory
+    file:
+      path: /opt/synth-postgres/data
+      state: directory
+      owner: ubuntu
+      group: ubuntu
+      mode: '0700'
+
+  - name: Pull PostgreSQL Docker image
+    shell: docker pull postgres:16-alpine
+    become_user: ubuntu
+
+  - name: Write PostgreSQL password secret (root-only)
+    copy:
+      dest: /etc/synth-pg.env
+      owner: root
+      group: root
+      mode: '0600'
+      content: |
+        PG_PASSWORD={{ pg_password }}
+
+  - name: Create PostgreSQL systemd service
+    copy:
+      dest: /etc/systemd/system/synth_postgres.service
+      content: |
+        [Unit]
+        Description=Synth Data Gen — PostgreSQL 16
+        After=docker.service
+        Requires=docker.service
+
+        [Service]
+        Restart=always
+        RestartSec=10
+        EnvironmentFile=/etc/synth-pg.env
+        ExecStartPre=-/usr/bin/docker rm -f synth_postgres
+        ExecStart=/usr/bin/docker run --rm --name synth_postgres \
+          -e POSTGRES_USER={{ pg_user }} \
+          -e POSTGRES_PASSWORD=${PG_PASSWORD} \
+          -e POSTGRES_DB={{ pg_db }} \
+          -e PGDATA=/var/lib/postgresql/data/pgdata \
+          -v /opt/synth-postgres/data:/var/lib/postgresql/data \
+          -p 127.0.0.1:{{ pg_port }}:5432 \
+          postgres:16-alpine
+        ExecStop=/usr/bin/docker stop synth_postgres
+
+        [Install]
+        WantedBy=multi-user.target
+
+  - name: Start PostgreSQL
+    systemd:
+      name: synth_postgres
+      daemon_reload: yes
+      enabled: yes
+      state: restarted
+
+  - name: Wait for PostgreSQL to be ready
+    shell: docker exec synth_postgres pg_isready -U {{ pg_user }} -d {{ pg_db }}
+    register: pg_ready
+    retries: 24
+    delay: 5
+    until: pg_ready.rc == 0
+
+  # ── FastAPI ───────────────────────────────────────────────────────────────
+  - name: Ensure uploaded dataset directory exists
+    file:
+      path: "{{ nemo_dir }}/uploaded_datasets"
+      state: directory
+      owner: ubuntu
+      group: ubuntu
+      mode: '0755'
+
+  - name: Ensure generated output directory exists
+    file:
+      path: "{{ nemo_dir }}/generated_output"
+      state: directory
+      owner: ubuntu
+      group: ubuntu
+      mode: '0755'
+
+  - name: Create FastAPI systemd service
+    copy:
+      dest: /etc/systemd/system/nemo_data_designer.service
+      content: |
+        [Unit]
+        Description=Nemo Data Designer FastAPI Service
+        After=network.target synth_postgres.service
+
+        [Service]
+        User=ubuntu
+        WorkingDirectory={{ nemo_dir }}
+        ExecStart={{ venv_dir }}/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+        Restart=always
+        RestartSec=5
+        Environment=PYTHONUNBUFFERED=1
+        Environment=PROXY_SECRET_KEY={{ proxy_secret_key }}
+        EnvironmentFile=/etc/synth-pg.env
+        Environment=DATABASE_URL=postgresql://{{ pg_user }}:${PG_PASSWORD}@127.0.0.1:{{ pg_port }}/{{ pg_db }}
+
+        [Install]
+        WantedBy=multi-user.target
+
+  - name: Reload systemd
+    systemd:
+      daemon_reload: yes
+
+  - name: Enable and start FastAPI service
+    systemd:
+      name: nemo_data_designer
+      enabled: yes
+      state: restarted
+
+  - name: Wait for FastAPI health endpoint
+    uri:
+      url: http://127.0.0.1:8000/ok
+      status_code: 200
+    register: fastapi_health
+    retries: 60
+    delay: 5
+    until: fastapi_health.status == 200
+
+  # ── Nginx ─────────────────────────────────────────────────────────────────
+  - name: Create NGINX reverse proxy configuration
+    copy:
+      dest: "{{ nginx_conf_path }}"
+      content: |
+        server {
+            listen 80;
+
+            location /synth-data-gen/ {
+                add_header Access-Control-Allow-Origin "*" always;
+                add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+                add_header Access-Control-Allow-Headers "Authorization, Content-Type" always;
+                add_header Access-Control-Allow-Credentials "true" always;
+                if ($request_method = OPTIONS) { return 204; }
+                proxy_pass http://127.0.0.1:8000/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_read_timeout 3600;
+                client_max_body_size 100M;
+            }
+        }
+
+  - name: Enable NGINX site
+    file:
+      src: "{{ nginx_conf_path }}"
+      dest: "{{ nginx_link_path }}"
+      state: link
+      force: yes
+
+  - name: Remove default NGINX config
+    file:
+      path: /etc/nginx/sites-enabled/default
+      state: absent
+
+  - name: Restart NGINX
+    systemd:
+      name: nginx
+      state: restarted
